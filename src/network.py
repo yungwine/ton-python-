@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 import asyncio
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -5,7 +6,7 @@ from ipaddress import IPv4Address
 import json
 import logging
 from pathlib import Path
-from signal import SIGTERM
+import signal
 import subprocess
 import time
 import types
@@ -13,11 +14,15 @@ from typing import final, override
 
 from pytonlib import TonlibClient, TonlibError
 from pydantic import BaseModel
+
 import tonapi
 import tonlibapi
+
+from .wallet import ExternalMessage, SimpleWallet
 from .install import Install
 from .zerostate import NetworkConfig, Zerostate, create_zerostate
 from .key import Key
+from .log_streamer import LogStreamer
 
 l = logging.getLogger(__name__)
 
@@ -40,27 +45,24 @@ def _write_model(file: Path, model: BaseModel):
 
 @final
 class Network:
-    class Node:
-        name: str
-
-        _network: "Network"
-        _directory: Path
-        _keyring: Path
-        _static_nodes: list["DHTNode"]
-
+    class Node(ABC):
         def __init__(self, network: "Network", name: str):
-            self._network = network
-            self.name = name
+            self._network: Network = network
+            self.name: str = name
 
-            self._directory = self._network._directory / ("node" + str(self._network._node_idx))
+            self._directory: Path = self._network._directory / (
+                "node" + str(self._network._node_idx)
+            )
             self._network._node_idx += 1
 
-            self._keyring = self._directory / "keyring"
+            self._keyring: Path = self._directory / "keyring"
             self._keyring.mkdir(parents=True)
 
-            self._static_nodes = []
+            self._static_nodes: list["DHTNode"] = []
 
             self.__process: asyncio.subprocess.Process | None = None
+            self.__process_watcher: asyncio.Task[None] | None = None
+            self.__log_streamer: LogStreamer | None = None
 
         @property
         def _install(self):
@@ -81,9 +83,6 @@ class Network:
         def _ensure_no_zerostate_yet(self):
             assert self._network._status < _Status.ZEROSTATE_GENERATED
 
-        def _get_or_generate_zerostate(self):
-            return self._network._get_or_generate_zerostate()
-
         async def _run(
             self,
             executable: Path,
@@ -91,6 +90,15 @@ class Network:
             validator_config: tonapi.validator_config_Global | None,
             additional_args: list[str],
         ):
+            async def process_watcher():
+                assert self.__process is not None
+                return_code = await self.__process.wait()
+                if return_code < 0:
+                    signal_name = signal.Signals(-return_code).name
+                    l.info(f"Node '{self.name}' terminated by signal {signal_name}")
+                else:
+                    l.info(f"Node '{self.name}' exited with code {return_code}")
+
             assert self._network._status < _Status.CLOSED
 
             global_config_file = self._directory / "config.global.json"
@@ -111,6 +119,9 @@ class Network:
             local_config_file = self._directory / "config.json"
             _write_model(local_config_file, local_config)
 
+            log_path = self._directory / "log"
+            l.info(f"Running {self.name} and saving its raw log to {log_path}")
+
             self.__process = await asyncio.create_subprocess_exec(
                 executable,
                 "--global-config",
@@ -121,26 +132,48 @@ class Network:
                 ".",
                 *additional_args,
                 cwd=self._directory,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            assert self.__process.stderr is not None  # to placate pyright
+            self.__process_watcher = asyncio.create_task(process_watcher())
+
+            self.__log_streamer = LogStreamer(
+                open(log_path, "wb"),
+                self.name,
+                self.__process.stderr,
             )
 
         def announce_to(self, dht: "DHTNode"):
             self._static_nodes.append(dht)
 
+        @abstractmethod
+        async def run(self):
+            pass
+
         async def stop(self):
             if self.__process:
-                try:
+                # No exception can occur between self.__process and self._log_streamer creation
+                assert self.__log_streamer is not None
+                assert self.__process_watcher is not None
+
+                if not self.__process_watcher.done():
                     l.info(f"Killing node '{self.name}'")
-                    self.__process.send_signal(SIGTERM)
-                    _ = await self.__process.wait()
-                except Exception:
-                    l.exception(f"Unable to kill node '{self.name}'")
-                self.__process = None
+                    try:
+                        self.__process.terminate()
+                    except ProcessLookupError:
+                        # Terminate might still fail if Python internally has already finished
+                        # waiting for the child process but didn't yet resume the watcher.
+                        pass
+
+                await self.__process_watcher
+                await self.__log_streamer.aclose()
 
     def __init__(self, install: Install, directory: Path):
         self._install = install
         self._directory = directory.absolute()
         self._port = 2000
         self._node_idx = 0
+        self._wallet_idx = 0
         self._status = _Status.INITED
 
         self.__nodes: list["Network.Node"] = []
@@ -163,7 +196,8 @@ class Network:
         self.__full_nodes.append(node)
         return node
 
-    def _get_or_generate_zerostate(self) -> Zerostate:
+    @property
+    def zerostate(self) -> Zerostate:
         if self.__zerostate is not None:
             return self.__zerostate
 
@@ -197,7 +231,7 @@ class Network:
         exc_value: BaseException | None,
         traceback: types.TracebackType | None,
     ) -> bool | None:
-        await self.aclose()
+        await asyncio.shield(self.aclose())
 
     async def wait_mc_block(self, seqno: int):
         client = await self.__full_nodes[0].tonlib_client()
@@ -232,6 +266,19 @@ class Network:
                 break
             else:
                 time.sleep(0.2)
+
+    async def send_external_message(self, message: ExternalMessage):
+        await self.__full_nodes[0].send_external(message)
+
+    def create_wallet(self, workchain: int):
+        idx = self._wallet_idx
+        self._wallet_idx += 1
+
+        return SimpleWallet.create(
+            self._install,
+            self._directory / f"wallet-{idx}",
+            workchain,
+        )
 
 
 @final
@@ -279,6 +326,7 @@ class DHTNode(Network.Node):
     def signed_address(self):
         return self._signed_address
 
+    @override
     async def run(self):
         await self._run(self._install.dht_server_exe, self._local_config, None, [])
 
@@ -356,8 +404,9 @@ class FullNode(Network.Node):
     def validator_key(self):
         return self._validator_key
 
+    @override
     async def run(self):
-        zerostate = self._get_or_generate_zerostate()
+        zerostate = self._network.zerostate
 
         static_dir = self._directory / "static"
         static_dir.mkdir()
@@ -383,7 +432,7 @@ class FullNode(Network.Node):
                     port=self._liteserver_addr.port,
                 ),
             ],
-            validator=self._get_or_generate_zerostate().as_validator_config(),
+            validator=self._network.zerostate.as_validator_config(),
         )
 
         keystore_dir = self._directory / "lc-keystore"
@@ -399,6 +448,32 @@ class FullNode(Network.Node):
         await self._client.init()
 
         return self._client
+
+    async def send_external(self, message: ExternalMessage):
+        client = await self.tonlib_client()
+
+        while True:
+            try:
+                await client.raw_send_message(message.boc)
+            except TonlibError as e:
+                # FIXME: We should really let node notify us that it is ready.
+                try:
+                    if (
+                        e.result["code"] == 500
+                        and (
+                            e.result["message"]
+                            == "LITE_SERVER_NETWORKtimeout for adnl query query"  # node is not synced yet
+                            or e.result["message"]
+                            == "LITE_SERVER_NETWORK"  # node is not listening the socket
+                        )
+                    ):
+                        time.sleep(0.2)
+                        continue
+                except Exception:
+                    pass
+                raise
+            # FIXME: Return something indicating whether the message was accepted.
+            break
 
     @override
     async def stop(self):

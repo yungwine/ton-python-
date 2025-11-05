@@ -4,8 +4,9 @@ from pathlib import Path
 
 import tonapi
 
+from .wallet import SimpleWallet
 from .key import Key
-from .install import Install, run_fift
+from .install import Install, run_fift_create_state
 
 
 def _shard_json_repr(shard: int):
@@ -21,7 +22,6 @@ class NetworkConfig:
     global_version: int = 11
     shard_validators: int = 1
     block_limit_mul: int = 1
-    mc_validators: int = 1
 
 
 @dataclass
@@ -35,6 +35,7 @@ class WorkchainState:
 class Zerostate:
     masterchain: WorkchainState
     shardchain: WorkchainState
+    main_wallet: SimpleWallet
 
     def as_block(self):
         return tonapi.tonNode_blockIdExt(
@@ -295,13 +296,11 @@ hashu dup =: zerostate_rhash 256 u>B "zerostate.rhash" B>file
 def create_zerostate(
     install: Install, state_dir: Path, config: NetworkConfig, validator_keys: list[Key]
 ) -> Zerostate:
-    assert len(validator_keys) >= config.mc_validators
-
     keys: list[str] = []
     for key in validator_keys:
         keys.append(f"B{{{key.public_key.key.hex()}}} 17 add-validator")
 
-    run_fift(
+    run_fift_create_state(
         install,
         _TEMPLATE.format(
             monitor_min_split=config.monitor_min_split,
@@ -310,7 +309,7 @@ def create_zerostate(
             shard_val=config.shard_validators,
             block_limit_mul=config.block_limit_mul,
             validators="\n".join(keys),
-            mc_validators=config.mc_validators,
+            mc_validators=len(keys),
         ),
         state_dir,
     )
@@ -326,4 +325,5 @@ def create_zerostate(
             file_hash=(state_dir / "basestate0.fhash").read_bytes(),
             root_hash=(state_dir / "basestate0.rhash").read_bytes(),
         ),
+        main_wallet=SimpleWallet.from_path(install, state_dir / "main-wallet", 0),
     )

@@ -10,3 +10,6 @@ wheels/
 .venv
 
 .ruff_cache
+
+# Canonical location for local network
+.network
